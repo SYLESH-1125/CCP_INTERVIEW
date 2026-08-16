@@ -1,0 +1,364 @@
+from google import genai
+from google.genai import types
+import os
+import json
+from typing import Dict, Any
+from dotenv import load_dotenv
+from .company_intelligence import get_company_intelligence
+
+load_dotenv()
+
+class GeminiService:
+    def __init__(self):
+        api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            print("WARNING: GOOGLE_API_KEY or GEMINI_API_KEY not found in environment. AI services will be unavailable.")
+            self.client = None
+        else:
+            api_key = api_key.strip()
+            if not (api_key.startswith("AIza") or api_key.startswith("AQ.")):
+                print("WARNING: The configured key does not look like a valid Google Gemini API key. Expected format starts with 'AIza' or 'AQ.'.")
+            try:
+                self.client = genai.Client(api_key=api_key)
+            except Exception as e:
+                print(f"WARNING: Gemini client initialization failed: {e}")
+                self.client = None
+        self.model_name = "gemini-2.5-flash"
+
+    def _fallback_analysis(self, resume_text: str, jd: str = None) -> dict:
+        return {
+            "ats_score": 0,
+            "strengths": ["Resume content was captured successfully."],
+            "weaknesses": ["AI analysis could not run because the Gemini service is unavailable right now."],
+            "tips": ["Review the job description and improve alignment with the target role."],
+            "fallback": True,
+            "source": "offline_fallback",
+            "job_description": jd,
+            "resume_excerpt": resume_text[:300]
+        }
+
+    def _fallback_question(self, role: str, sub_role: str, difficulty: int, company: str = None, round_name: str = "Technical", interviewer_name: str = "Adinath") -> str:
+        company_text = f" for {company}" if company else ""
+        level = {1: "junior", 2: "mid-level", 3: "senior"}.get(difficulty, "junior")
+        return (
+            f"[{interviewer_name}]: Thanks for sharing your background. "
+            f"Let’s start with a quick assessment for the {level} {sub_role} {role} role{company_text}. "
+            f"Can you walk me through one project you are most proud of and explain the technical decisions you made?"
+        )
+
+    async def generate_text(self, prompt: str) -> str:
+        """Generic method to generate plain text response."""
+        if not self.client:
+            return "AI service is unavailable at the moment."
+        try:
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt
+            )
+            return response.text
+        except Exception as e:
+            print(f"DEBUG: Gemini generate_text failed: {e}")
+            return "AI service is unavailable at the moment."
+
+    async def generate_json(self, prompt: str) -> Dict[str, Any]:
+        """Generic method to generate and parse JSON response."""
+        if not self.client:
+            return {}
+        try:
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt
+            )
+            text = response.text
+            # Clean up JSON if wrapped in markdown code blocks
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0]
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0]
+            
+            try:
+                return json.loads(text.strip())
+            except json.JSONDecodeError:
+                print(f"DEBUG: Failed to parse JSON. Raw text: {text}")
+                return {}
+        except Exception as e:
+            print(f"DEBUG: Gemini generate_json failed: {e}")
+            return {}
+
+    async def analyze_resume(self, resume_text: str, jd: str = None):
+        """Premium Feature: Analyzes resume against a JD and provides ATS score + Gap Analysis."""
+        if not self.client:
+            return self._fallback_analysis(resume_text, jd)
+        try:
+            prompt = f"""
+            You are a Senior Technical Recruiter and ATS Optimization Expert.
+            
+            RESUME:
+            {resume_text}
+            
+            {f"JOB DESCRIPTION: {jd}" if jd else "General Industry Standards"}
+            
+            TASK:
+            1. Calculate an ATS Score (0-100).
+            2. Identify Key Strengths (3 points).
+            3. Identify Weaknesses/Gaps (3 points).
+            4. Provide actionable tips to improve the resume for this specific role.
+            
+            Return the result in JSON format:
+            {{
+                "ats_score": 85,
+                "strengths": [],
+                "weaknesses": [],
+                "tips": []
+            }}
+            """
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt
+            )
+            return response.text
+        except Exception as e:
+            print(f"DEBUG: Gemini analyze_resume failed: {e}")
+            return json.dumps(self._fallback_analysis(resume_text, jd))
+
+    async def generate_interview_question(self, role: str, sub_role: str, difficulty: int, company: str = None, round_name: str = "Technical", is_panel: bool = False, jd: str = None, resume_text: str = None, chat_history: list = [], current_time: str = None, interviewer_name: str = "Adinath", company_intel: dict = None):
+        """Generates a contextual interview question for different rounds."""
+        if not self.client:
+            return self._fallback_question(role, sub_role, difficulty, company, round_name, interviewer_name)
+
+        try:
+            difficulty_map = {1: "Junior", 2: "Mid-level", 3: "Senior/Lead"}
+            level = difficulty_map.get(difficulty, "Junior")
+
+            # Round-specific instructions
+            round_instructions = {
+                "Technical": """
+                FOCUS: Technical problem-solving, coding concepts, algorithms, data structures.
+                - Ask about specific technologies mentioned in resume
+                - Test depth of understanding
+                - Challenge with edge cases
+                - Ask about trade-offs and optimization
+                """,
+                "Behavioral": """
+                FOCUS: STAR method (Situation, Task, Action, Result), soft skills, cultural fit.
+                - Ask about past experiences and conflicts
+                - Test leadership and teamwork
+                - Explore decision-making under pressure
+                - Assess communication and empathy
+                """,
+                "System Design": """
+                FOCUS: Architecture, scalability, distributed systems, trade-offs.
+                """,
+                "Managerial": """
+                FOCUS: Leadership, team management, conflict resolution, strategic thinking.
+                """,
+                "Final": """
+                FOCUS: Vision, long-term goals, culture alignment, executive presence.
+                """
+            }
+
+            # Company Context Fusion
+            company_context = ""
+            if company_intel and not company_intel.get("error"):
+                # Use provided intelligence
+                status = "CURATED" if company_intel.get("is_curated") else "AGENTIC DISCOVERY"
+                company_context = f"\nINFO: COMPANY INTELLIGENCE ({status})\n"
+                company_context += f"COMPANY: {company_intel.get('name', company)}\n"
+                company_context += f"STYLE: {company_intel.get('interview_style', 'Standard')}\n"
+                company_context += f"RECONCILIATION: {company_intel.get('intelligence_reconciliation', 'N/A')}\n"
+            elif company:
+                # Fallback for when no intel is provided but we have a company name
+                company_context = f"\nINFO: Using general industry knowledge for {company}.\n"
+
+            # Panel Interview Logic
+            panel_instruction = f"""
+            ACT AS A PANEL: You represent multiple interviewers. 
+            - Interviewer A ({interviewer_name}): Lead Recruiter, focused on background.
+            - Interviewer B (Arav): Technical Architect, focused on efficiency.
+            Alternate between these two personas. Mention who is asking in the text (e.g., '[{interviewer_name}]: ...').
+            """ if is_panel else ""
+
+            system_prompt = f"""
+            You are {interviewer_name.upper()}, a Simulation Assistant designed to mimic high-level professional interviewers.
+            The name {interviewer_name} signifies eternal knowledge and primal wisdom.
+            Current Date/Time for context: {current_time if current_time else "Unknown"}
+            
+            CRITICAL IDENTITY INSTRUCTIONS:
+            - NEVER claim to be an actual employee of {company if company else "any firm"}.
+            - ALWAYS frame yourself as a simulation. Example: "I am {interviewer_name}, simulating a {round_name} interview round based on {company if company else "industry"} standards."
+            - Avoid phrases like "I work at Google" or "I am a recruiter at Amazon."
+            
+            You're simulating the {round_name} round for {sub_role} ({role} category) at a {level} level.
+            
+            {panel_instruction}
+            
+            {company_context}
+            
+            ROUND-SPECIFIC FOCUS:
+            {round_instructions.get(round_name, round_instructions["Technical"])}
+            
+            PROTOCOL:
+            - Turn 0 (Start): GREET the candidate warmly but professionally. 
+              1. Introduce yourself as {interviewer_name}.
+              2. Explicitly state this is an AI Simulation for the {round_name} round at {company if company else "your target firm"}.
+              3. EXPERT INSIGHT: If a 'RECONCILIATION INSIGHT' is provided in your context, warmly share it with the candidate to show how you've prepared for this session (e.g., "I've reconciled your job description with industry standards...").
+              4. Ask for a brief intro.
+            - Turn 1 (After Intro): Acknowledge their background. Mention something specific from their intro or resume.
+            - Turn 2+: Start the core {round_name} interview questions.
+            
+            { "PRESSURE MODE: Ask a follow-up optimization question and challenge the candidate's last answer." if len(chat_history) > 6 else "" }
+
+            YOUR GOAL:
+            - Ask ONE question at a time.
+            - BE CREATIVE & NON-STANDARD in core questions. 
+            - NO SUGARCOATING performance later, but maintain simulation boundaries.
+            - Tie questions to projects in resume if provided: {resume_text[:300] if resume_text else "None"}
+            - For {round_name} round, focus on {round_name.lower()}-specific competencies.
+            """
+
+            # Convert simple transcript list back to Gemini content objects
+            contents = []
+            for i, msg in enumerate(chat_history):
+                role_type = "model" if i % 2 == 0 else "user"
+                contents.append(types.Content(role=role_type, parts=[types.Part(text=msg)]))
+
+            # Add the instruction for the next turn
+            instruction = f"Please ask the first {round_name} question." if not contents else f"Please ask the next {round_name} follow-up question based on the conversation."
+            contents.append(types.Content(role="user", parts=[types.Part(text=instruction)]))
+            
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt
+                )
+            )
+            
+            return response.text
+        except Exception as e:
+            print(f"DEBUG: Gemini generate_interview_question failed: {e}")
+            return self._fallback_question(role, sub_role, difficulty, company, round_name, interviewer_name)
+
+    async def evaluate_answer(self, question: str, answer: str, role: str, round_name: str = "Technical", company: str = None, company_intel: dict = None):
+        """Evaluates answer with round-specific criteria and behavioral analysis."""
+        
+        # Round-specific evaluation criteria
+        eval_criteria = {
+            "Technical": "Technical accuracy, problem-solving approach, code quality, optimization",
+            "Behavioral": "STAR method usage, specific examples, emotional intelligence, self-awareness",
+            "System Design": "Scalability thinking, trade-off analysis, system components, failure handling",
+            "Managerial": "Leadership qualities, conflict resolution, strategic thinking, team management",
+            "Final": "Vision alignment, cultural fit, long-term thinking, executive presence"
+        }
+        
+        prompt = f"""
+        Round: {round_name}
+        Role: {role} at {company if company else "Tech Firm"}
+        Question: {question}
+        User Answer: {answer}
+        
+        COMPANY CONTEXT:
+        {company_intel if company_intel else "Standard Industry Patterns"}
+        
+        TASK:
+        1. Evaluate based on {round_name} criteria: {eval_criteria.get(round_name, eval_criteria["Technical"])}
+        2. BEHAVIORAL ANALYSIS (STAR Method): If this is a behavioral round, identify if they covered:
+           - Situation (S)
+           - Task (T)
+           - Action (A)
+           - Result (R)
+        3. VIBE ANALYSIS: Analyze tone, confidence, technical depth, and industry presence.
+        
+        RATING CRITERIA (1-10):
+        10: Mind-blowing, unique, and perfect.
+        7-8: Solid, industry standard.
+        5-6: Needs significant work, too generic.
+        <4: Reject.
+        
+        FEEDBACK STYLE:
+        - NO SUGARCOATING. Be direct. If the answer was bad, say why clearly.
+        
+        Return JSON:
+        {{
+            "score": float,
+            "feedback": "string",
+            "executive_summary": "1 sentence executive take",
+            "vibe_analysis": {{
+                "confidence_score": 0-10,
+                "hesitation_level": "High/Med/Low",
+                "assertiveness": "string feedback",
+                "technical_depth": "Expert/Moderate/Surface"
+            }},
+            "star_analysis": {{
+                "has_situation": boolean,
+                "has_task": boolean,
+                "has_action": boolean,
+                "has_result": boolean,
+                "missing_parts": ["S", "T", "A", "R"]
+            }},
+            "can_proceed": boolean
+        }}
+        """
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=prompt
+        )
+        return response.text
+
+    async def generate_master_report(self, session: dict):
+        """Generates a final Executive Scorecard after all rounds are finished."""
+        prompt = f"""
+        TRANSCRIPT SUMMARY: {str(session['transcript'])[:2000]}
+        ROUND SCORES: {session['round_scores']}
+        ROLE: {session['sub_role']} at {session['target_company']}
+        
+        TASK:
+        Generate a final "Executive Scorecard" for the candidate.
+        
+        Return JSON:
+        {{
+            "overall_score": float (avg),
+            "final_verdict": "STRONG HIRE / HIRE / WEAK HIRE / REJECT",
+            "key_strengths": ["string"],
+            "key_weaknesses": ["string"],
+            "competency_breakdown": {{
+                "Technical Skills": 0-10,
+                "Communication": 0-10,
+                "Leadership": 0-10,
+                "Problem Solving": 0-10
+            }},
+            "recruiter_closing_note": "A final direct feedback note."
+        }}
+        """
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=prompt
+        )
+        return response.text
+
+    async def generate_learning_roadmap(self, role: str, sub_role: str, failed_topics: list):
+        """Generates a 7-Day Curriculum after a failed round."""
+        prompt = f"""
+        The candidate failed their {sub_role} interview in these topics: {failed_topics}.
+        Generate a strict 7-Day Learning Roadmap.
+        
+        Day 1-2: Fundamentals of failed concepts.
+        Day 3-4: Advanced implementation and trade-offs.
+        Day 5: Real-world scenario practicing.
+        Day 6: Mock simulation prep.
+        Day 7: Final review.
+        
+        Return JSON:
+        {{
+            "focus_areas": [],
+            "curriculum": {{"Day 1": "..."}},
+            "resources": []
+        }}
+        """
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=prompt
+        )
+        return response.text
+
+gemini_service = GeminiService()
